@@ -1,0 +1,9 @@
+name: Checks
+on: [push, pull_request]
+jobs:
+  native:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift test
+      - run: bash -n restart.sh uninstall.sh
