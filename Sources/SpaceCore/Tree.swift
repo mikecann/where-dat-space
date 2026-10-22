@@ -7,13 +7,21 @@ public let smallFileThreshold: UInt64 = 512 * 1024
 
 public struct DiskNode: Sendable {
     public var size: UInt64
+    public var modified: Int64 = 0
+    var fileCount32: UInt32
+    public var count: UInt64 {
+        get { UInt64(fileCount32) }
+        set { precondition(newValue <= UInt32.max); fileCount32 = UInt32(newValue) }
+    }
+    /// nil means the filesystem did not return sharing metadata for the whole subtree.
+    public var mayShareBlocks: Bool? { flags & 16 != 0 ? true : flags & 32 != 0 ? false : nil }
     public var parent: NodeID
     public var firstChild: NodeID
     public var nextSibling: NodeID
     public var nameOffset: UInt32
-    public var nameLength: UInt32
-    public var count: UInt32
-    public var flags: UInt32
+    public var nameLength: UInt16
+    public var fileCount: UInt64 { count }
+    public var flags: UInt16
     public var isDirectory: Bool { flags & 1 != 0 }
     public var isAggregate: Bool { flags & 2 != 0 }
     public var isUnreadable: Bool { flags & 4 != 0 }
@@ -32,18 +40,23 @@ public struct DiskTree: Sendable {
     /// Useful for small synthetic layouts and tests as well as importing scan results.
     public init(rootPath: String) {
         let bytes = Array(rootPath.utf8)
-        self.init(nodes: [DiskNode(size: 0, parent: noNode, firstChild: noNode, nextSibling: noNode,
-                                  nameOffset: 0, nameLength: UInt32(bytes.count), count: 0, flags: 1)],
+        self.init(nodes: [DiskNode(size: 0, fileCount32: 0, parent: noNode, firstChild: noNode, nextSibling: noNode,
+                                  nameOffset: 0, nameLength: UInt16(bytes.count), flags: 1)],
                   names: bytes, rootPath: rootPath)
     }
 
-    @discardableResult public mutating func append(name: String, size: UInt64, parent: NodeID, directory: Bool = false, count: UInt32 = 1) -> NodeID {
+    @discardableResult public mutating func append(name: String, size: UInt64, parent: NodeID, directory: Bool = false, count: UInt64 = 1, modified: Int64 = 0) -> NodeID {
         let id = NodeID(nodes.count), bytes = Array(name.utf8)
-        nodes.append(DiskNode(size: size, parent: parent, firstChild: noNode, nextSibling: nodes[Int(parent)].firstChild,
-                              nameOffset: UInt32(names.count), nameLength: UInt32(bytes.count), count: count, flags: directory ? 1 : 0))
+        nodes.append(DiskNode(size: size, modified: modified, fileCount32: directory ? 0 : UInt32(count), parent: parent, firstChild: noNode, nextSibling: nodes[Int(parent)].firstChild,
+                              nameOffset: UInt32(names.count), nameLength: UInt16(bytes.count), flags: directory ? 1 : 0))
         names.append(contentsOf: bytes); nodes[Int(parent)].firstChild = id
         var ancestor = parent
-        while ancestor != noNode { nodes[Int(ancestor)].size += size; ancestor = nodes[Int(ancestor)].parent }
+        while ancestor != noNode {
+            nodes[Int(ancestor)].size += size
+            nodes[Int(ancestor)].count += directory ? 0 : count
+            nodes[Int(ancestor)].modified = max(nodes[Int(ancestor)].modified, modified)
+            ancestor = nodes[Int(ancestor)].parent
+        }
         return id
     }
 
@@ -89,7 +102,11 @@ public struct DiskTree: Sendable {
         guard id != 0, !self[id].isRemoved else { return }
         let size = self[id].size
         var parent = self[id].parent
-        while parent != noNode { nodes[Int(parent)].size -= min(size, nodes[Int(parent)].size); parent = self[parent].parent }
+        while parent != noNode {
+            nodes[Int(parent)].size -= min(size, nodes[Int(parent)].size)
+            nodes[Int(parent)].count -= min(self[id].count, nodes[Int(parent)].count)
+            parent = self[parent].parent
+        }
         let owner = self[id].parent
         var child = self[owner].firstChild, previous = noNode
         while child != noNode {

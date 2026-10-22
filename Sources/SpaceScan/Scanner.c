@@ -14,17 +14,23 @@
 #include <errno.h>
 #include <time.h>
 
+_Static_assert(sizeof(SpaceNode)==40, "Retained scanner nodes must remain compact");
+
 #define NONE UINT32_MAX
 #define DIRECTORY 1u
 #define SMALL_FILES 2u
 #define UNREADABLE 4u
+#define MAY_SHARE 16u
+#define SHARING_KNOWN 32u
 #define QUEUE_INITIAL 1024
 // Bulk metadata avoids a syscall and Swift allocation for every file.
 #define BULK_BYTES (64 * 1024)
 typedef struct { uint64_t inode; dev_t device; } LinkKey;
 typedef struct { uint32_t index; int fd; } DirectoryJob;
 typedef struct { uint32_t index; const char *name; } PendingDirectory;
+typedef struct { uint64_t size; int64_t modified; uint32_t parent, sharing; char *name; } SmallLargest;
 struct SpaceScan {
+    SmallLargest *largest; size_t largest_count, largest_limit;
     pthread_mutex_t lock;
     pthread_cond_t ready;
     atomic_bool cancelled;
@@ -53,13 +59,13 @@ static void *grow(void *buffer, size_t *capacity, size_t need, size_t width) {
     *capacity = cap; return new_buffer;
 }
 // Caller holds the lock. Append-only indices make final bottom-up totals linear.
-static uint32_t add_node(SpaceScan *s, uint32_t parent, const char *name, uint64_t size, uint32_t flags, uint32_t count) {
+static uint32_t add_node(SpaceScan *s, uint32_t parent, const char *name, uint64_t size, uint32_t flags, uint64_t count, int64_t modified) {
     size_t length = strlen(name);
-    if (s->node_count >= NONE || s->names_count + length >= NONE) { s->error = EOVERFLOW; atomic_store(&s->cancelled, 1); return NONE; }
+    if (s->node_count >= NONE || s->names_count + length >= NONE || length > UINT16_MAX || count > UINT32_MAX) { s->error = EOVERFLOW; atomic_store(&s->cancelled, 1); return NONE; }
     s->nodes = grow(s->nodes, &s->node_capacity, s->node_count + 1, sizeof(SpaceNode));
     s->names = grow(s->names, &s->names_capacity, s->names_count + length, 1);
     uint32_t i = (uint32_t)s->node_count++;
-    SpaceNode n = { .size=size, .parent=parent, .first_child=NONE, .next_sibling=NONE,
+    SpaceNode n = { .size=size, .modified=modified, .parent=parent, .first_child=NONE, .next_sibling=NONE,
         .name_offset=(uint32_t)s->names_count, .name_length=(uint32_t)length, .flags=flags, .count=count };
     memcpy(s->names + s->names_count, name, length); s->names_count += length;
     if (parent != NONE) { n.next_sibling = s->nodes[parent].first_child; s->nodes[parent].first_child = i; }
@@ -104,15 +110,38 @@ static int duplicate_link(SpaceScan *s, uint64_t inode, dev_t device) {
     s->links[slot]=(LinkKey){inode,device}; s->link_count++; return 0;
 }
 static void unreadable(SpaceScan *s, uint32_t index) {
-    if (!(s->nodes[index].flags & UNREADABLE)) { s->nodes[index].flags |= UNREADABLE; s->progress.unreadable++; }
+    if (!(s->nodes[index].flags & UNREADABLE)) { s->nodes[index].flags |= UNREADABLE; s->nodes[index].flags &= ~SHARING_KNOWN; s->progress.unreadable++; }
 }
-typedef struct { uint64_t bytes; uint32_t count; } Small;
+typedef struct { uint64_t bytes, count; int64_t modified; uint32_t sharing; int sharing_unknown; } Small;
+static int marker(const char *name) {
+    static const char *names[]={"package.json","Package.swift","Cargo.toml","build.gradle","build.gradle.kts",
+        "settings.gradle","settings.gradle.kts","Podfile","pyproject.toml","requirements.txt","setup.py","Pipfile",".git"};
+    for (size_t i=0;i<sizeof(names)/sizeof(names[0]);i++) if (!strcmp(name,names[i])) return 1;
+    return 0;
+}
+// A min heap keeps only the requested largest folded files, independent of file count.
+static void small_largest(SpaceScan *s, uint32_t parent, const char *name, uint64_t size, int64_t modified, uint32_t sharing) {
+    if (!s->largest_limit) return;
+    size_t i;
+    if (s->largest_count < s->largest_limit) {
+        i=s->largest_count++;
+        s->largest[i]=(SmallLargest){size,modified,parent,sharing,strdup(name)};
+        while (i) { size_t p=(i-1)/2; if (s->largest[p].size<=s->largest[i].size) break;
+            SmallLargest temp=s->largest[p]; s->largest[p]=s->largest[i]; s->largest[i]=temp; i=p; }
+    } else if (size > s->largest[0].size) {
+        free(s->largest[0].name); s->largest[0]=(SmallLargest){size,modified,parent,sharing,strdup(name)}; i=0;
+        for (;;) { size_t c=i*2+1; if(c>=s->largest_count) break;
+            if(c+1<s->largest_count && s->largest[c+1].size<s->largest[c].size) c++;
+            if(s->largest[i].size<=s->largest[c].size) break;
+            SmallLargest temp=s->largest[c]; s->largest[c]=s->largest[i]; s->largest[i]=temp; i=c; }
+    }
+}
 static uint32_t entry(SpaceScan *s, uint32_t parent, const char *name, uint32_t type, uint64_t size,
-                  uint32_t links, uint64_t inode, dev_t device, uint32_t error, Small *small) {
+                  uint32_t links, uint64_t inode, dev_t device, uint32_t error, int64_t modified, uint32_t sharing, Small *small) {
     if (!strcmp(name,".") || !strcmp(name,"..")) return NONE;
     if (type == VDIR) {
         if (device != s->device) return NONE;
-        uint32_t child=add_node(s,parent,name,0,DIRECTORY,0);
+        uint32_t child=add_node(s,parent,name,0,DIRECTORY|SHARING_KNOWN,0,modified);
         s->progress.folders++;
         if (child == NONE) return NONE;
         if (error) unreadable(s,child); else return child;
@@ -121,8 +150,14 @@ static uint32_t entry(SpaceScan *s, uint32_t parent, const char *name, uint32_t 
         if (links > 1 && duplicate_link(s,inode,device)) { s->progress.duplicates++; return NONE; }
         if (error) { unreadable(s,parent); return NONE; }
         s->progress.bytes += size;
-        if (size >= s->threshold) add_node(s,parent,name,size,0,1);
-        else { small->bytes += size; small->count++; }
+        if (size >= s->threshold || marker(name)) add_node(s,parent,name,size,sharing,1,modified);
+        else {
+            small->bytes += size; small->count++;
+            if (modified > small->modified) small->modified=modified;
+            if (!(sharing & SHARING_KNOWN)) small->sharing_unknown=1;
+            small->sharing |= sharing;
+            small_largest(s,parent,name,size,modified,sharing);
+        }
     } else if (error) unreadable(s,parent);
     return NONE;
 }
@@ -161,33 +196,34 @@ static void schedule_child(SpaceScan *s, int parent_fd, uint32_t index, const ch
 #define READ_VALUE(dst) do { memcpy(&(dst), cursor, sizeof(dst)); cursor += sizeof(dst); } while(0)
 static int scan_bulk(SpaceScan *s, int fd, uint32_t parent, Small *small, char *buffer) {
     struct attrlist attrs = { .bitmapcount=ATTR_BIT_MAP_COUNT,
-        .commonattr=ATTR_CMN_RETURNED_ATTRS|ATTR_CMN_ERROR|ATTR_CMN_NAME|ATTR_CMN_DEVID|ATTR_CMN_OBJTYPE|ATTR_CMN_FILEID,
-        .fileattr=ATTR_FILE_LINKCOUNT|ATTR_FILE_ALLOCSIZE };
+        .commonattr=ATTR_CMN_RETURNED_ATTRS|ATTR_CMN_ERROR|ATTR_CMN_NAME|ATTR_CMN_DEVID|ATTR_CMN_OBJTYPE|ATTR_CMN_MODTIME|ATTR_CMN_FILEID,
+        .fileattr=ATTR_FILE_LINKCOUNT|ATTR_FILE_ALLOCSIZE, .forkattr=ATTR_CMNEXT_EXT_FLAGS };
     int count;
-    while (!atomic_load(&s->cancelled) && (count=getattrlistbulk(fd,&attrs,buffer,BULK_BYTES,FSOPT_PACK_INVAL_ATTRS)) > 0) {
+    while (!atomic_load(&s->cancelled) && (count=getattrlistbulk(fd,&attrs,buffer,BULK_BYTES,FSOPT_PACK_INVAL_ATTRS|FSOPT_ATTR_CMN_EXTENDED)) > 0) {
         char *record=buffer;
         PendingDirectory pending[BULK_BYTES / 32]; size_t pending_count=0;
         pthread_mutex_lock(&s->lock);
         for (int i=0; i<count; i++) {
             const char *cursor=record; uint32_t length, error, type, links; uint64_t inode; off_t allocated; dev_t device;
-            attribute_set_t returned; attrreference_t name;
+            attribute_set_t returned; attrreference_t name; struct timespec modified; uint64_t extended_flags;
             READ_VALUE(length); READ_VALUE(returned); READ_VALUE(error);
-            const char *name_base=cursor; READ_VALUE(name); READ_VALUE(device); READ_VALUE(type); READ_VALUE(inode);
-            READ_VALUE(links); READ_VALUE(allocated);
+            const char *name_base=cursor; READ_VALUE(name); READ_VALUE(device); READ_VALUE(type); READ_VALUE(modified); READ_VALUE(inode);
+            READ_VALUE(links); READ_VALUE(allocated); READ_VALUE(extended_flags);
             const char *filename=name_base+name.attr_dataoffset;
             if (!(returned.commonattr & ATTR_CMN_DEVID)) device=s->device;
             // Some non-APFS volumes return only a subset of the requested fields.
             // Never silently treat an unsupported allocation attribute as zero.
-            if (!error && (!(returned.commonattr & ATTR_CMN_OBJTYPE) ||
+            if (!error && (!(returned.commonattr & ATTR_CMN_MODTIME) || !(returned.commonattr & ATTR_CMN_OBJTYPE) ||
                 (type==VREG && (!(returned.commonattr & ATTR_CMN_FILEID) ||
                 (returned.fileattr & (ATTR_FILE_LINKCOUNT|ATTR_FILE_ALLOCSIZE)) != (ATTR_FILE_LINKCOUNT|ATTR_FILE_ALLOCSIZE))))) {
                 struct stat info;
                 if (!fstatat(fd,filename,&info,AT_SYMLINK_NOFOLLOW)) {
                     type=S_ISDIR(info.st_mode)?VDIR:S_ISREG(info.st_mode)?VREG:VLNK;
-                    allocated=info.st_blocks*512; links=info.st_nlink; inode=info.st_ino; device=info.st_dev;
+                    allocated=info.st_blocks*512; links=info.st_nlink; inode=info.st_ino; device=info.st_dev; modified=info.st_mtimespec;
                 } else error=errno;
             }
-            uint32_t child=entry(s,parent,filename,type,allocated > 0 ? (uint64_t)allocated : 0,links,inode,device,error,small);
+            uint32_t child=entry(s,parent,filename,type,allocated > 0 ? (uint64_t)allocated : 0,links,inode,device,error,modified.tv_sec,
+                (returned.forkattr & ATTR_CMNEXT_EXT_FLAGS) ? SHARING_KNOWN | ((extended_flags & EF_MAY_SHARE_BLOCKS) ? MAY_SHARE : 0) : 0,small);
             if (child != NONE) pending[pending_count++]=(PendingDirectory){child,filename};
             record += length;
         }
@@ -207,7 +243,7 @@ static void scan_fallback(SpaceScan *s, int fd, uint32_t parent, Small *small) {
         }
         uint32_t type=S_ISDIR(st.st_mode)?VDIR:S_ISREG(st.st_mode)?VREG:VLNK;
         pthread_mutex_lock(&s->lock);
-        uint32_t child=entry(s,parent,item->d_name,type,(uint64_t)st.st_blocks*512,st.st_nlink,st.st_ino,st.st_dev,0,small);
+        uint32_t child=entry(s,parent,item->d_name,type,(uint64_t)st.st_blocks*512,st.st_nlink,st.st_ino,st.st_dev,0,st.st_mtimespec.tv_sec,0,small);
         pthread_mutex_unlock(&s->lock);
         schedule_child(s,fd,child,item->d_name);
     }
@@ -241,7 +277,7 @@ static void *worker(void *context) {
         free(path);
         pthread_mutex_lock(&s->lock);
         if (failure) unreadable(s,index);
-        if (small.count) add_node(s,index,"",small.bytes,SMALL_FILES,small.count);
+        if (small.count) add_node(s,index,"",small.bytes,SMALL_FILES | (small.sharing_unknown ? (small.sharing & ~SHARING_KNOWN) : small.sharing),small.count,small.modified);
         s->active--; pthread_cond_broadcast(&s->ready); pthread_mutex_unlock(&s->lock);
     }
     free(buffer); return NULL;
@@ -259,7 +295,7 @@ SpaceScan *space_scan_create(const char *path, uint64_t threshold, int workers) 
     if (lstat(s->root,&st)) s->error=errno;
     else if (!S_ISDIR(st.st_mode)) s->error=ENOTDIR;
     else s->device=st.st_dev;
-    add_node(s,NONE,s->root,0,DIRECTORY,0); enqueue(s,0,-1); s->progress.folders=1;
+    add_node(s,NONE,s->root,0,DIRECTORY|SHARING_KNOWN,0,s->error ? 0 : st.st_mtimespec.tv_sec); enqueue(s,0,-1); s->progress.folders=1;
     clock_gettime(CLOCK_MONOTONIC,&s->started); return s;
 }
 int space_scan_run(SpaceScan *s) {
@@ -268,7 +304,15 @@ int space_scan_run(SpaceScan *s) {
     for(int i=0;i<s->workers;i++) if (!pthread_create(&threads[created],NULL,worker,s)) created++;
     if (!created) worker(s);
     for(int i=0;i<created;i++) pthread_join(threads[i],NULL);
-    for(size_t i=s->node_count;i-->1;) s->nodes[s->nodes[i].parent].size += s->nodes[i].size;
+    for(size_t i=s->node_count;i-->1;) {
+        SpaceNode *child=&s->nodes[i], *parent=&s->nodes[child->parent];
+        parent->size += child->size;
+        if ((uint64_t)parent->count + child->count > UINT32_MAX) { s->error=EOVERFLOW; break; }
+        parent->count += child->count;
+        if (child->modified > parent->modified) parent->modified=child->modified;
+        parent->flags |= child->flags & MAY_SHARE;
+        if (!(child->flags & SHARING_KNOWN)) parent->flags &= ~SHARING_KNOWN;
+    }
     s->progress.elapsed=seconds_since(s->started);
     return s->error;
 }
@@ -279,5 +323,14 @@ size_t space_scan_node_count(SpaceScan *s) { return s->node_count; }
 const char *space_scan_names(SpaceScan *s) { return s->names; }
 size_t space_scan_names_count(SpaceScan *s) { return s->names_count; }
 int space_scan_error(SpaceScan *s) { return s->error; }
-void space_scan_destroy(SpaceScan *s) { if (!s) return; for (size_t i=0;i<s->queue_count;i++) if(s->queue[i].fd>=0) close(s->queue[i].fd); pthread_mutex_destroy(&s->lock); pthread_cond_destroy(&s->ready); free(s->nodes); free(s->names); free(s->root); free(s->queue); free(s->links); free(s); }
+void space_scan_destroy(SpaceScan *s) { if (!s) return; for (size_t i=0;i<s->queue_count;i++) if(s->queue[i].fd>=0) close(s->queue[i].fd); pthread_mutex_destroy(&s->lock); pthread_cond_destroy(&s->ready); for(size_t i=0;i<s->largest_count;i++) free(s->largest[i].name); free(s->largest); free(s->nodes); free(s->names); free(s->root); free(s->queue); free(s->links); free(s); }
 uint64_t space_peak_memory(void) { struct rusage usage; getrusage(RUSAGE_SELF,&usage); return (uint64_t)usage.ru_maxrss; }
+
+void space_scan_set_largest(SpaceScan *s, size_t limit) { s->largest_limit=limit; s->largest=calloc(limit,sizeof(SmallLargest)); }
+size_t space_scan_small_largest_count(SpaceScan *s) { return s->largest_count; }
+uint32_t space_scan_small_largest_parent(SpaceScan *s, size_t i) { return s->largest[i].parent; }
+const char *space_scan_small_largest_name(SpaceScan *s, size_t i) { return s->largest[i].name; }
+uint64_t space_scan_small_largest_size(SpaceScan *s, size_t i) { return s->largest[i].size; }
+int64_t space_scan_small_largest_modified(SpaceScan *s, size_t i) { return s->largest[i].modified; }
+
+uint32_t space_scan_small_largest_sharing(SpaceScan *s, size_t i) { return s->largest[i].sharing; }

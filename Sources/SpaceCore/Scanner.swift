@@ -16,6 +16,8 @@ public struct ScanProgress: Sendable {
 }
 
 public struct ScanResult: Sendable {
+    public let scannedAt: Date
+    public let largestFiles: [FileReport]
     public let tree: DiskTree
     public let progress: ScanProgress
     public let peakMemory: UInt64
@@ -26,16 +28,19 @@ public struct ScanResult: Sendable {
 public final class DiskScanner: @unchecked Sendable {
     private let context: OpaquePointer
     private let path: String
+    private let largestLimit: Int
     private let stateLock = NSLock()
     private var didRun = false
     private var wasCancelled = false
 
-    public init(path: String, workers: Int = min(16, ProcessInfo.processInfo.activeProcessorCount)) throws {
+    public init(path: String, workers: Int = min(16, ProcessInfo.processInfo.activeProcessorCount), largest: Int = 25, retainingFilesAtLeast: UInt64 = smallFileThreshold) throws {
+        self.largestLimit = min(10_000, max(0, largest))
         self.path = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardized.path
-        guard let context = space_scan_create(self.path, smallFileThreshold, Int32(workers)) else { throw CocoaError(.fileReadUnknown) }
+        guard let context = space_scan_create(self.path, min(smallFileThreshold, retainingFilesAtLeast), Int32(workers)) else { throw CocoaError(.fileReadUnknown) }
         self.context = context
         let error = space_scan_error(context)
         if error != 0 { throw POSIXError(POSIXErrorCode(rawValue: error) ?? .EIO) }
+        space_scan_set_largest(context, largestLimit)
     }
     deinit { space_scan_destroy(context) }
 
@@ -60,10 +65,33 @@ public final class DiskScanner: @unchecked Sendable {
         guard error == 0 else { throw POSIXError(POSIXErrorCode(rawValue: error) ?? .EIO) }
         let count = space_scan_node_count(context)
         let raw = UnsafeBufferPointer(start: space_scan_nodes(context), count: count)
-        let nodes = raw.map { DiskNode(size: $0.size, parent: $0.parent, firstChild: $0.first_child, nextSibling: $0.next_sibling,
-                                      nameOffset: $0.name_offset, nameLength: $0.name_length, count: $0.count, flags: $0.flags) }
+        let nodes = raw.map { DiskNode(size: $0.size, modified: $0.modified, fileCount32: $0.count, parent: $0.parent, firstChild: $0.first_child, nextSibling: $0.next_sibling,
+                                      nameOffset: $0.name_offset, nameLength: $0.name_length, flags: $0.flags) }
         let names = UnsafeBufferPointer(start: space_scan_names(context), count: space_scan_names_count(context)).map { UInt8(bitPattern: $0) }
-        return ScanResult(tree: DiskTree(nodes: nodes, names: names, rootPath: path), progress: progress(),
+        let tree = DiskTree(nodes: nodes, names: names, rootPath: path)
+        var largest: [FileReport] = []
+        if largestLimit > 0 {
+            // Keep this list bounded even when the scan retains millions of file nodes.
+            func consider(_ file: FileReport) {
+                if largest.count == largestLimit && file.bytes <= largest.last!.bytes { return }
+                let position = largest.firstIndex { $0.bytes < file.bytes } ?? largest.count
+                largest.insert(file, at: position)
+                if largest.count > largestLimit { largest.removeLast() }
+            }
+            for i in nodes.indices where !nodes[i].isDirectory && !nodes[i].isAggregate {
+                if largest.count < largestLimit || nodes[i].size > largest.last!.bytes {
+                    consider(FileReport(path: tree.path(of: NodeID(i)), bytes: nodes[i].size, newestModified: isoTime(nodes[i].modified), mayShareBlocks: nodes[i].mayShareBlocks))
+                }
+            }
+            for i in 0..<space_scan_small_largest_count(context) {
+                let parent = tree.path(of: space_scan_small_largest_parent(context, i))
+                let name = String(cString: space_scan_small_largest_name(context, i))
+                consider(FileReport(path: URL(fileURLWithPath: parent).appendingPathComponent(name).path,
+                    bytes: space_scan_small_largest_size(context, i), newestModified: isoTime(space_scan_small_largest_modified(context, i)),
+                    mayShareBlocks: space_scan_small_largest_sharing(context, i) & 32 != 0 ? space_scan_small_largest_sharing(context, i) & 16 != 0 : nil))
+            }
+        }
+        return ScanResult(scannedAt: Date(), largestFiles: largest, tree: tree, progress: progress(),
                           peakMemory: space_peak_memory(), cancelled: stateLock.withLock { wasCancelled })
     }
     public static var peakMemory: UInt64 { space_peak_memory() }

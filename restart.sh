@@ -3,12 +3,38 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP="${WHERE_DAT_SPACE_APP_PATH:-$HOME/Applications/Where Dat Space.app}"
 CLI="${WHERE_DAT_SPACE_CLI_PATH:-$HOME/.local/bin/where-dat-space}"
+CLAUDE_SKILL="${WHERE_DAT_SPACE_CLAUDE_SKILL_PATH:-$HOME/.claude/skills/where-dat-space}"
+CODEX_SKILL="${WHERE_DAT_SPACE_CODEX_SKILL_PATH:-$HOME/.codex/skills/where-dat-space}"
+# Stop only processes running from this exact destination, including isolated test installs.
+app_pids() {
+  local PID
+  while read -r PID; do
+    if [[ "$(ps -p "$PID" -o comm= 2>/dev/null || true)" == "$APP/Contents/MacOS/WhereDatSpace" ]]; then echo "$PID"; fi
+  done < <(pgrep -x WhereDatSpace || true)
+}
+stop_app() {
+  local PID WAIT
+  while read -r PID; do
+    [[ -n "$PID" ]] || continue
+    kill -TERM "$PID" 2>/dev/null || true
+    for WAIT in {1..30}; do
+      if ! kill -0 "$PID" 2>/dev/null; then break; fi
+      sleep 0.1
+    done
+    if kill -0 "$PID" 2>/dev/null; then
+      echo 'Where Dat Space? is still running at this install path. Close it before continuing.' >&2
+      return 1
+    fi
+  done < <(app_pids)
+}
 BUNDLE_ID='com.mikerosoft.where-dat-space'
 export CLANG_MODULE_CACHE_PATH="$ROOT/.build/module-cache"
 export SWIFTPM_MODULECACHE_OVERRIDE="$ROOT/.build/module-cache"
 cd "$ROOT"
-swift build -c release --disable-sandbox
-BIN_DIR="$(swift build -c release --show-bin-path --disable-sandbox)"
+BUILD_ARGS=(--disable-sandbox)
+if [[ -n "${WHERE_DAT_SPACE_BUILD_SYSTEM:-}" ]]; then BUILD_ARGS+=(--build-system "$WHERE_DAT_SPACE_BUILD_SYSTEM"); fi
+swift build -c release "${BUILD_ARGS[@]}"
+BIN_DIR="$(swift build -c release --show-bin-path "${BUILD_ARGS[@]}")"
 STAGE_ROOT="$(mktemp -d "$ROOT/.build/stage.XXXXXX")"
 trap 'rm -rf "$STAGE_ROOT"' EXIT
 STAGE="$STAGE_ROOT/Where Dat Space.app"
@@ -67,21 +93,22 @@ if [[ -e "$CLI" || -L "$CLI" ]]; then
     exit 1
   fi
 fi
-if pgrep -x WhereDatSpace >/dev/null; then
-  pkill -TERM -x WhereDatSpace || true
-  for WAIT in {1..30}; do
-    if ! pgrep -x WhereDatSpace >/dev/null; then break; fi
-    sleep 0.1
-  done
-  if pgrep -x WhereDatSpace >/dev/null; then
-    echo 'Where Dat Space? is still running. Close it before installing.' >&2
-    exit 1
+for LINK in "$CLAUDE_SKILL" "$CODEX_SKILL"; do
+  if [[ -e "$LINK" || -L "$LINK" ]]; then
+    if [[ ! -L "$LINK" || "$(readlink "$LINK")" != "$ROOT/skill" ]]; then
+      echo "An unrelated item exists at $LINK. Move it before installing." >&2
+      exit 1
+    fi
   fi
-fi
-mkdir -p "$(dirname "$APP")" "$(dirname "$CLI")"
+done
+stop_app
+mkdir -p "$(dirname "$APP")" "$(dirname "$CLI")" "$(dirname "$CLAUDE_SKILL")" "$(dirname "$CODEX_SKILL")"
 if [[ -d "$APP" ]]; then rm -rf "$APP"; fi
 mv "$STAGE" "$APP"
 ln -sfn "$APP/Contents/MacOS/WhereDatSpace" "$CLI"
+ln -sfn "$ROOT/skill" "$CLAUDE_SKILL"
+ln -sfn "$ROOT/skill" "$CODEX_SKILL"
 if [[ "${WHERE_DAT_SPACE_OPEN:-1}" != 0 ]]; then open "$APP"; fi
 echo "Installed $APP"
 echo "CLI: $CLI"
+echo "Skills: $CLAUDE_SKILL and $CODEX_SKILL"
