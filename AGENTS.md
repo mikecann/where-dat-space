@@ -14,7 +14,8 @@ This is a native macOS 14+ disk-usage treemap, part of Mikerosoft. Swift 6, Swif
 
 ## Code layout
 
-- `Sources/WhereDatSpace`: app entry point, scan and selection state, SwiftUI views, AppKit map interaction, headless flags and `AgentCLI.swift` for JSON and safe Trash batches.
+- `Sources/WhereDatSpace`: app entry point, scan and selection state, SwiftUI views, AppKit map interaction, headless flags, `AgentCLI.swift` for JSON and safe Trash batches, and `FolderWatcher.swift` (FSEvents) for live updates.
+- Live updates: a changed folder gets a shallow scan (`DiskScanner(shallow: true)`, just its own entries) applied with `DiskTree.applyListing`; only new folders and manual Rescans scan right through (`replaceContents`). See `Sources/SpaceCore/Refresh.swift`. Keep view and selection restored by path, as refreshes remove nodes and compaction renumbers them.
 - `Sources/SpaceCore`: tree, Swift scanner wrapper, agent reports and size parsing, cleanup rule table, streaming duplicate finder, pure Trash policy, squarified layout, colours and cushion renderer.
 - `Sources/SpaceScan`: pthread scanner and public `include/SpaceScan.h`, using `space_` C prefixes.
 - `Tests/SpaceCoreTests`: layout, allocation, hard links, sparse files, permissions, folding, cancellation, removal accounting, PNG/hit testing and `AgentTests.swift` for metadata, report pruning, candidate rules, duplicate hashes and Trash refusals.

@@ -27,13 +27,15 @@ public struct ScanResult: Sendable {
 /// The C context synchronizes progress and cancellation while its workers own all writes.
 public final class DiskScanner: @unchecked Sendable {
     private let context: OpaquePointer
-    private let path: String
+    /// The standardised path being scanned, which becomes the tree's root path.
+    public let path: String
     private let largestLimit: Int
     private let stateLock = NSLock()
     private var didRun = false
     private var wasCancelled = false
 
-    public init(path: String, workers: Int = min(16, ProcessInfo.processInfo.activeProcessorCount), largest: Int = 25, retainingFilesAtLeast: UInt64 = smallFileThreshold) throws {
+    /// `shallow` lists just this folder: child folders come back as empty nodes, unopened.
+    public init(path: String, workers: Int = min(16, ProcessInfo.processInfo.activeProcessorCount), largest: Int = 25, retainingFilesAtLeast: UInt64 = smallFileThreshold, shallow: Bool = false) throws {
         self.largestLimit = min(10_000, max(0, largest))
         self.path = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardized.path
         guard let context = space_scan_create(self.path, min(smallFileThreshold, retainingFilesAtLeast), Int32(workers)) else { throw CocoaError(.fileReadUnknown) }
@@ -41,6 +43,7 @@ public final class DiskScanner: @unchecked Sendable {
         let error = space_scan_error(context)
         if error != 0 { throw POSIXError(POSIXErrorCode(rawValue: error) ?? .EIO) }
         space_scan_set_largest(context, largestLimit)
+        space_scan_set_shallow(context, shallow ? 1 : 0)
     }
     deinit { space_scan_destroy(context) }
 

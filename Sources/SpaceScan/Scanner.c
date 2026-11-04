@@ -39,6 +39,7 @@ struct SpaceScan {
     DirectoryJob *queue; size_t queue_count, queue_capacity;
     size_t queued_descriptors, descriptor_limit, eviction_cursor;
     int active, workers, error;
+    int shallow;
     dev_t device;
     char *root;
     uint64_t threshold;
@@ -164,7 +165,8 @@ static uint32_t entry(SpaceScan *s, uint32_t parent, const char *name, uint32_t 
 // Keep a bounded number of open child directories. Most work can then use
 // openat rather than resolving every ancestor for millions of deep paths.
 static void schedule_child(SpaceScan *s, int parent_fd, uint32_t index, const char *name) {
-    if (index == NONE || atomic_load(&s->cancelled)) return;
+    // A shallow scan lists one folder: its child folders get nodes but aren't opened.
+    if (index == NONE || s->shallow || atomic_load(&s->cancelled)) return;
     pthread_mutex_lock(&s->lock);
     int evicted_fd=-1;
     // The work stack is depth-first. Give its newest jobs the cached handles,
@@ -298,6 +300,7 @@ SpaceScan *space_scan_create(const char *path, uint64_t threshold, int workers) 
     add_node(s,NONE,s->root,0,DIRECTORY|SHARING_KNOWN,0,s->error ? 0 : st.st_mtimespec.tv_sec); enqueue(s,0,-1); s->progress.folders=1;
     clock_gettime(CLOCK_MONOTONIC,&s->started); return s;
 }
+void space_scan_set_shallow(SpaceScan *s, int shallow) { s->shallow=shallow; }
 int space_scan_run(SpaceScan *s) {
     if (s->error) return s->error;
     pthread_t threads[16]; int created=0;

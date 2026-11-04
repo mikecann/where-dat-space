@@ -25,6 +25,8 @@ const char *space_scan_small_largest_name(SpaceScan *scan, size_t index);
 uint64_t space_scan_small_largest_size(SpaceScan *scan, size_t index);
 uint32_t space_scan_small_largest_sharing(SpaceScan *scan, size_t index);
 int64_t space_scan_small_largest_modified(SpaceScan *scan, size_t index);
+// List only the folder itself, leaving child folders as empty, unopened nodes.
+void space_scan_set_shallow(SpaceScan *scan, int shallow);
 int space_scan_run(SpaceScan *scan);
 void space_scan_cancel(SpaceScan *scan);
 void space_scan_progress(SpaceScan *scan, SpaceProgress *progress);

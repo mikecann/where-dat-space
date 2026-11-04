@@ -14,7 +14,7 @@ My 1 TB MacBook kept filling up, so I wanted the GrandPerspective / WinDirStat s
 
 ## Using it
 
-Choose a folder with **⌘O**, or use **Scan Home** or **Scan Whole Disk**. Whole Disk scans `/System/Volumes/Data` so the same folders don't appear twice through macOS firmlinks. The last folder is remembered, and **⌘R** rescans it.
+Choose a folder with **⌘O**, or use **Scan Home** or **Scan Whole Disk**. Whole Disk scans `/System/Volumes/Data` so the same folders don't appear twice through macOS firmlinks. The last folder is remembered. The map keeps itself up to date: delete, move or add something in Finder or a terminal and it updates within a couple of seconds, staying zoomed where you are. **⌘R** rescans the folder you're looking at in place, and **⇧⌘R** rescans everything.
 
 Hover for a path, allocated size and percentage of the current view. Click to select in the map and size-sorted sidebar. Double-click a folder to zoom in, then use a breadcrumb, **Escape** or **⌘↑** to go back up. Colours can follow file type or top folder. **Cushions** switches the soft shading on and off.
 

@@ -15,7 +15,7 @@ struct ContentView: View {
                     GeometryReader { geometry in
                         ZStack(alignment: .topTrailing) {
                             MapView(model: model)
-                            if model.rendering { ProgressView().controlSize(.small).padding(10).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8)).padding(8) }
+                            if model.rendering || model.refreshing { ProgressView().controlSize(.small).padding(10).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8)).padding(8) }
                             if tree[model.root].size == 0 { ContentUnavailableView("Nothing to map here", systemImage: "square.dashed", description: Text("This folder is empty, uses no allocated space, or could not be read.")) }
                         }
                         .onAppear { model.resize(geometry.size, dark: scheme == .dark) }
@@ -57,7 +57,7 @@ struct ContentView: View {
                     Button("Whole Disk (Data volume)") { model.scan("/System/Volumes/Data") }
                     Button("Last Folder") { model.scan(model.lastPath) }
                 } label: { Label("Quick Scan", systemImage: "internaldrive") }
-                Button(action: model.rescan) { Label("Rescan", systemImage: "arrow.clockwise") }.help("Have another look at this folder (⌘R)").disabled(model.scanning)
+                Button(action: model.rescan) { Label("Rescan", systemImage: "arrow.clockwise") }.help("Have another look at this folder (⌘R). Changes on disk show up by themselves too.").disabled(model.scanning || model.refreshing)
             }
             ToolbarItemGroup {
                 Picker("Colour", selection: $model.colorMode) {

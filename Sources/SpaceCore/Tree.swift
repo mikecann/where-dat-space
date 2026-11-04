@@ -29,8 +29,10 @@ public struct DiskNode: Sendable {
 }
 
 public struct DiskTree: Sendable {
-    public private(set) var nodes: [DiskNode]
-    private var names: [UInt8]
+    public internal(set) var nodes: [DiskNode]
+    var names: [UInt8]
+    /// Removed nodes still in `nodes`, so refreshes know when to compact.
+    public internal(set) var removedCount = 0
     public let rootPath: String
 
     init(nodes: [DiskNode], names: [UInt8], rootPath: String) {
@@ -120,7 +122,7 @@ public struct DiskTree: Sendable {
         var pending = [id]
         while let current = pending.popLast() {
             pending.append(contentsOf: children(of: current, sorted: false))
-            nodes[Int(current)].flags |= 8
+            nodes[Int(current)].flags |= 8; removedCount += 1
         }
     }
 }

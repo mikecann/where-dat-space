@@ -41,7 +41,8 @@ struct WhereDatSpaceApp: App {
                 }
                 CommandGroup(replacing: .newItem) {
                     Button("Open Folder…", action: model.chooseFolder).keyboardShortcut("o")
-                    Button("Rescan", action: model.rescan).keyboardShortcut("r").disabled(model.scanning)
+                    Button("Rescan This Folder", action: model.rescan).keyboardShortcut("r").disabled(model.scanning || model.refreshing)
+                    Button("Rescan Everything", action: model.rescanEverything).keyboardShortcut("r", modifiers: [.command, .shift]).disabled(model.scanning)
                     Button("Go Up", action: model.goUp).keyboardShortcut(.upArrow, modifiers: .command)
                 }
             }
